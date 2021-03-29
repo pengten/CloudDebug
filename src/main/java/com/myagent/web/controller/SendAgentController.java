@@ -1,6 +1,7 @@
 package com.myagent.web.controller;
 
 import com.alibaba.fastjson.JSON;
+import com.myagent.web.builder.ValueBuilder;
 import com.myagent.web.model.RemoteValue;
 import com.sun.jdi.*;
 import com.sun.jdi.connect.AttachingConnector;
@@ -11,7 +12,9 @@ import com.sun.jdi.request.BreakpointRequest;
 import com.sun.jdi.request.EventRequest;
 import com.sun.jdi.request.EventRequestManager;
 import com.sun.tools.jdi.SocketAttachingConnector;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.util.CollectionUtils;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -37,6 +40,9 @@ public class SendAgentController {
     @Value("${java.library.path}")
     private String libPath;
 
+    @Autowired
+    private List<ValueBuilder> valueBuilders;
+
     private static VirtualMachine virtualMachine = null;
 
     @GetMapping("/send")
@@ -57,7 +63,7 @@ public class SendAgentController {
                 Map<String, Connector.Argument> arguments = sac.defaultArguments();
                 Connector.Argument hostArg = arguments.get("hostname");
                 Connector.Argument portArg = arguments.get("port");
-                hostArg.setValue("127.0.0.1");
+                hostArg.setValue("emcooperate-5.gz00b.dev.alipay.net");
                 portArg.setValue("8000");
 
                 virtualMachine = sac.attach(arguments);
@@ -127,8 +133,14 @@ public class SendAgentController {
     }
 
     private RemoteValue covertValue(String name, com.sun.jdi.Value value, int num) {
-        if (num >= 10) {
-            return new RemoteValue(name, String.class.getName(), "......");
+        if (!CollectionUtils.isEmpty(valueBuilders)) {
+            ValueBuilder valueBuilder = valueBuilders.stream().filter(e -> e.support(name, value)).findAny().orElse(null);
+            if (valueBuilder != null) {
+                return valueBuilder.build(name, value);
+            }
+        }
+        if (num >= 3) {
+            return new RemoteValue(name, value == null ? null : value.type().name(), "......");
         }
         if (value instanceof IntegerValue) {
             return new RemoteValue(name, value.type().name(), ((IntegerValue) value).value());
@@ -188,6 +200,7 @@ public class SendAgentController {
             values.forEach((f, v) -> variables.add(covertValue(f.name(), v, num + 1)));
             return remoteValue;
         }
-        return new RemoteValue(name, value.type().name(), null);
+
+        return new RemoteValue(name, value == null ? null : value.type().name(), null);
     }
 }
