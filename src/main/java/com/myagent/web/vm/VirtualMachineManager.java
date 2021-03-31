@@ -1,21 +1,22 @@
 package com.myagent.web.vm;
 
 import com.myagent.web.AttachException;
-import com.myagent.web.cache.LocalCache;
 import com.sun.jdi.Bootstrap;
 import com.sun.jdi.VirtualMachine;
 import com.sun.jdi.connect.AttachingConnector;
 import com.sun.jdi.connect.Connector;
 import com.sun.jdi.connect.IllegalConnectorArgumentsException;
+import com.sun.jdi.event.EventSet;
 import com.sun.tools.jdi.SocketAttachingConnector;
 
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class VirtualMachineManager {
 
-    private static final LocalCache<VirtualMachine> vmCache = new LocalCache<>();
+    private static final ConcurrentHashMap<String, VirtualMachine> vmCache = new ConcurrentHashMap<>();
 
     public static VirtualMachine attach(String host, String port) {
         String cacheKey = host + ":" + port;
@@ -52,5 +53,20 @@ public class VirtualMachineManager {
         hostArg.setValue(host);
         portArg.setValue(port);
         return sac.attach(arguments);
+    }
+
+    public static EventSet takeEvent() {
+        while (true) {
+            for (VirtualMachine vm : vmCache.values()) {
+                try {
+                    EventSet eventSet = vm.eventQueue().remove(100);
+                    if (eventSet != null) {
+                        return eventSet;
+                    }
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+            }
+        }
     }
 }
