@@ -3,15 +3,13 @@ package com.myagent.web.controller;
 import com.alibaba.fastjson.JSON;
 import com.myagent.web.builder.ValueBuilder;
 import com.myagent.web.model.RemoteValue;
+import com.myagent.web.vm.VirtualMachineManager;
 import com.sun.jdi.*;
-import com.sun.jdi.connect.AttachingConnector;
-import com.sun.jdi.connect.Connector;
-import com.sun.jdi.connect.IllegalConnectorArgumentsException;
 import com.sun.jdi.event.*;
 import com.sun.jdi.request.BreakpointRequest;
 import com.sun.jdi.request.EventRequest;
 import com.sun.jdi.request.EventRequestManager;
-import com.sun.tools.jdi.SocketAttachingConnector;
+import com.sun.jdi.request.StepRequest;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.util.CollectionUtils;
@@ -20,10 +18,12 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
-import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @RestController
 @RequestMapping("/agent")
@@ -43,60 +43,44 @@ public class SendAgentController {
     @Autowired
     private List<ValueBuilder> valueBuilders;
 
-    private static VirtualMachine virtualMachine = null;
+    private static final String[] INCLUDE_CLASS = {"^java\\..+", "^com\\.alipay\\..+"};
 
     @GetMapping("/send")
-    public void sendAgent(@RequestParam String className, @RequestParam Integer line) {
+    public void sendAgent(@RequestParam String className, @RequestParam String lines) {
+        VirtualMachine virtualMachine = VirtualMachineManager.attach("emcooperate-5.gz00b.dev.alipay.net", "8000");
         try {
-            // 获取SocketAttachingConnector,连接其它JVM称之为附加(attach)操作
-            if (virtualMachine == null) {
-                VirtualMachineManager vmm = Bootstrap.virtualMachineManager();
-                List<AttachingConnector> connectors = vmm.attachingConnectors();
-                SocketAttachingConnector sac = null;
-                for (AttachingConnector ac : connectors) {
-                    if (ac instanceof SocketAttachingConnector) {
-                        sac = (SocketAttachingConnector) ac;
-                    }
-                }
-                assert sac != null;
-                // 设置好主机地址，端口信息
-                Map<String, Connector.Argument> arguments = sac.defaultArguments();
-                Connector.Argument hostArg = arguments.get("hostname");
-                Connector.Argument portArg = arguments.get("port");
-                hostArg.setValue("emcooperate-5.gz00b.dev.alipay.net");
-                portArg.setValue("8000");
-
-                virtualMachine = sac.attach(arguments);
-
-            }
-
             EventRequestManager eventRequestManager = virtualMachine.eventRequestManager();
             ClassType clazz = (ClassType) virtualMachine.classesByName(className).get(0);
-            Location location = clazz.locationsOfLine(line).get(0);
-            BreakpointRequest breakpointRequest = eventRequestManager.createBreakpointRequest(location);
-            breakpointRequest.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
-            breakpointRequest.enable();
+            List<Location> locations = clazz.allLineLocations();
+            String[] lineArr = lines.split(",");
+            locations.stream()
+                    .filter(location -> Arrays.asList(lineArr).contains(Integer.toString(location.lineNumber())))
+                    .forEach(location -> {
+                        BreakpointRequest breakpointRequest = eventRequestManager.createBreakpointRequest(location);
+                        breakpointRequest.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+                        breakpointRequest.enable();
+                    });
 
 
             EventQueue eventQueue = virtualMachine.eventQueue();
-            EventSet eventSet = eventQueue.remove();
-            try {
-                EventIterator eventIterator = eventSet.eventIterator();
-                while (eventIterator.hasNext()) {
-                    Event event = eventIterator.next();
-                    try {
-                        execute(event);
-                    } catch (Exception e) {
-                        e.printStackTrace();
+            while (true) {
+                EventSet eventSet = eventQueue.remove();
+                try {
+                    EventIterator eventIterator = eventSet.eventIterator();
+                    while (eventIterator.hasNext()) {
+                        Event event = eventIterator.next();
+                        try {
+                            execute(event);
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                        }
                     }
+                } finally {
+                    eventSet.resume();
                 }
-            } finally {
-                eventSet.resume();
             }
 
-        } catch (IOException
-                | IllegalConnectorArgumentsException
-                | AbsentInformationException
+        } catch (AbsentInformationException
                 | InterruptedException e) {
             e.printStackTrace(System.err);
         } finally {
@@ -110,22 +94,50 @@ public class SendAgentController {
     private void execute(Event event)
             throws IncompatibleThreadStateException, AbsentInformationException {
         if (event instanceof BreakpointEvent) {
-
+            event.virtualMachine().eventRequestManager().deleteEventRequest(event.request());
             BreakpointEvent breakpointEvent = (BreakpointEvent) event;
             ThreadReference threadReference = breakpointEvent.thread();
             StackFrame stackFrame = threadReference.frame(0);
-
             stackFrame.visibleVariables();
-
             // 获取date变量
             List<LocalVariable> localVariables = stackFrame.visibleVariables();
-            localVariables.forEach(
-                    var -> {
-                        com.sun.jdi.Value value = stackFrame.getValue(var);
-                        Object o = covertValue(var.name(), value, 0);
-                        store(o);
-                    });
+            localVariables.stream()
+                    .filter(e -> variableFileter(e.typeName()))
+                    .forEach(
+                            var -> {
+                                com.sun.jdi.Value value = stackFrame.getValue(var);
+                                Object o = covertValue(var.name(), value, 0);
+                                store(o);
+                            });
+            StepRequest stepRequest = event.virtualMachine().eventRequestManager().createStepRequest(threadReference, StepRequest.STEP_LINE, StepRequest.STEP_OVER);
+            stepRequest.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+            stepRequest.enable();
+        } else if (event instanceof StepEvent) {
+            ThreadReference threadReference = ((StepEvent) event).thread();
+            StackFrame stackFrame = threadReference.frame(0);
+            stackFrame.visibleVariables();
+            // 获取date变量
+            List<LocalVariable> localVariables = stackFrame.visibleVariables();
+            localVariables.stream()
+                    .filter(e -> variableFileter(e.typeName()))
+                    .forEach(
+                            var -> {
+                                com.sun.jdi.Value value = stackFrame.getValue(var);
+                                Object o = covertValue(var.name(), value, 0);
+                                store(o);
+                            });
         }
+    }
+
+    private boolean variableFileter(String typeName) {
+        for (String excludeClass : INCLUDE_CLASS) {
+            Pattern pattern = Pattern.compile(excludeClass);
+            Matcher matcher = pattern.matcher(typeName);
+            if (matcher.matches()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void store(Object o) {
@@ -181,23 +193,15 @@ public class SendAgentController {
             return new RemoteValue(name, value.type().name(), array);
         }
 
-        if (value instanceof ClassObjectReference) {
-            RemoteValue remoteValue = new RemoteValue(name, value.type().name(), new ArrayList<>());
-            List<RemoteValue> variables = remoteValue.getVariables();
-            ClassObjectReference objectReference = (ClassObjectReference) value;
-            List<Field> fields = objectReference.referenceType().visibleFields();
-            Map<Field, com.sun.jdi.Value> values = objectReference.getValues(fields);
-            values.forEach((f, v) -> variables.add(covertValue(f.name(), v, num + 1)));
-            return remoteValue;
-        }
-
         if (value instanceof ObjectReference) {
             RemoteValue remoteValue = new RemoteValue(name, value.type().name(), new ArrayList<>());
             List<RemoteValue> variables = remoteValue.getVariables();
             ObjectReference objectReference = (ObjectReference) value;
             List<Field> fields = objectReference.referenceType().visibleFields();
             Map<Field, com.sun.jdi.Value> values = objectReference.getValues(fields);
-            values.forEach((f, v) -> variables.add(covertValue(f.name(), v, num + 1)));
+            values.entrySet().stream()
+                    .filter(e -> variableFileter(e.getKey().typeName()))
+                    .forEach(entry -> variables.add(covertValue(entry.getKey().name(), entry.getValue(), num + 1)));
             return remoteValue;
         }
 
